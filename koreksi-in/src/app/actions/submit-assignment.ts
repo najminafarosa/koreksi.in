@@ -1,80 +1,94 @@
 'use server'
 
-import { createClient } from '@/lib/supabase/server'
+import { createClient } from '@/src/lib/supabase/server'
 import { revalidatePath } from 'next/cache'
 
-export async function submitAssignment(formData: FormData) {
+export async function submitAssignment(roomId: string, formData: FormData) {
     const supabase = await createClient()
 
+    const studentNim = (formData.get('student_nim') as string)?.trim()
+    const studentName = (formData.get('student_name') as string)?.trim()
     const file = formData.get('file') as File
-    const roomId = formData.get('room_id') as string
-    const studentNim = formData.get('student_nim') as string
-    const studentName = formData.get('student_name') as string
 
-    if (!file || !roomId || !studentNim || !studentName) {
-        return { error: 'Semua field wajib diisi' }
+    if (!studentNim || !studentName || !file || file.size === 0) {
+        return { error: 'Mohon isi NIM, Nama, dan unggah file PDF jawaban.' }
     }
 
-    try {
-        // 1. Upload File ke Supabase Storage (Bucket: 'assignment')
-        const fileExt = file.name.split('.').pop()
-        const fileName = `${roomId}/${studentNim}_${Date.now()}.${fileExt}`
+    if (file.type !== 'application/pdf') {
+        return { error: 'Format file harus berupa dokumen PDF.' }
+    }
 
-        const { data: storageData, error: uploadError } = await supabase.storage
-            .from('assignment')
-            .upload(fileName, file)
+    // 0. Ambil room_code terlebih dahulu dari tabel rooms berdasarkan roomId
+    const { data: roomData, error: roomError } = await supabase
+        .from('rooms')
+        .select('room_code')
+        .eq('id', roomId)
+        .single()
 
-        if (uploadError) {
-            console.error('Storage Upload Error:', uploadError)
-            return { error: 'Gagal mengunggah file PDF' }
-        }
+    if (roomError || !roomData) {
+        return { error: 'Gagal memuat data room yang dituju.' }
+    }
 
-        // 2. Dapatkan Public URL File yang diunggah
-        const { data: urlData } = supabase.storage
-            .from('assignment')
-            .getPublicUrl(fileName)
+    // 1. Upload file PDF ke Supabase Storage (bucket: 'assignment')
+    const fileExt = file.name.split('.').pop()
+    const fileName = `${roomId}/${studentNim}-${Date.now()}.${fileExt}`
 
-        const fileUrl = urlData.publicUrl
+    const { error: uploadError } = await supabase.storage
+        .from('assignment')
+        .upload(fileName, file, {
+            cacheControl: '3600',
+            upsert: false,
+        })
 
-        // 3. Simpan Initial Record Submission ke Database Supabase
-        const { data: submission, error: dbError } = await supabase
-            .from('submissions')
-            .insert({
+    if (uploadError) {
+        return { error: `Gagal mengunggah file: ${uploadError.message}` }
+    }
+
+    // Dapatkan Public URL file yang diunggah
+    const { data: publicUrlData } = supabase.storage
+        .from('assignment')
+        .getPublicUrl(fileName)
+
+    const filePath = publicUrlData.publicUrl
+
+    // 2. Simpan record ke tabel 'submissions' dan dapatkan ID-nya
+    const { data: insertedData, error: insertError } = await supabase
+        .from('submissions')
+        .insert([
+            {
                 room_id: roomId,
                 student_nim: studentNim,
                 student_name: studentName,
-                file_path: fileUrl,
-                status: 'pending'
-            })
-            .select()
-            .single()
+                file_path: filePath,
+            },
+        ])
+        .select('id')
+        .single()
 
-        if (dbError) {
-            console.error('Database Error:', dbError)
-            return { error: 'Gagal menyimpan data pengumpulan' }
-        }
-
-        // 4. Trigger n8n Production Webhook secara Asynchronous (Background)
-        const n8nWebhookUrl = process.env.N8N_WEBHOOK_URL
-        if (n8nWebhookUrl) {
-            fetch(n8nWebhookUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    submission_id: submission.id,
-                    room_id: roomId,
-                    student_nim: studentNim,
-                    student_name: studentName,
-                    file_url: fileUrl
-                })
-            }).catch((err) => console.error('Error triggering n8n webhook:', err))
-        }
-
-        revalidatePath(`/room/${roomId}`)
-        return { success: true, submissionId: submission.id }
-
-    } catch (err) {
-        console.error('Server Action Error:', err)
-        return { error: 'Terjadi kesalahan pada server' }
+    if (insertError) {
+        return { error: `Gagal menyimpan data pengumpulan: ${insertError.message}` }
     }
+
+    // 3. Pemicu Webhook ke n8n dengan menyertakan room_code
+    try {
+        await fetch('https://n8n.koreksi-in.web.id/webhook/process-submission', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                submission_id: insertedData.id,
+                room_id: roomId,
+                room_code: roomData.room_code, // <-- room_code sekarang ikut terkirim ke n8n
+                student_nim: studentNim,
+                student_name: studentName,
+                file_url: filePath,
+            }),
+        })
+    } catch (webhookError) {
+        console.error('Gagal mengirim webhook ke n8n:', webhookError)
+    }
+
+    revalidatePath(`/room/${roomId}/dashboard`)
+    return { success: true }
 }
