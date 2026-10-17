@@ -6,6 +6,8 @@ import CreateRoomModal from './create-room-modal'
 import { Room } from '@/src/types'
 import { BookOpen, Calendar, UserCheck } from 'lucide-react'
 
+export const dynamic = 'force-dynamic'
+
 export default async function TeacherDashboardPage() {
     const supabase = await createClient()
 
